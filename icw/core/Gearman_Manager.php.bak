@@ -1,0 +1,1262 @@
+<?php
+/**
+ * PHP script for managing PHP based Gearman workers
+ * Copyright (c) 2010, Brian Moon
+ * All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *  * Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *  * Neither the name of Brian Moon nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ **/
+declare(ticks = 1);
+
+/**
+ * Class that handles all the process management
+ */
+class CI_Gearman_Manager {
+	/**
+	 * Default config section name
+	 */
+	const DEFAULT_CONFIG = "GearmanManager";
+	/**
+	 * Defines job priority limits
+	 */
+	const MIN_PRIORITY = -5;
+	const MAX_PRIORITY = 5;
+	/**
+	 * Holds the worker configuration
+	 */
+	protected $mgr_config = array();
+	/**
+	 * Boolean value that determines if the running code is the parent or a child
+	 */
+	protected $isparent = true;
+	public   $uid =array();
+	public $user_info  =array();
+	/**
+	 * When true, workers will stop look for jobs and the parent process will
+	 * kill off all running children
+	 */
+	protected $stop_work = false;
+
+	/**
+	 * The timestamp when the signal was received to stop working
+	 */
+	protected $stop_time = 0;
+
+
+	/**
+	 * Verbosity level for the running script. Set via -v option
+	 */
+	protected $verbose = 0;
+
+	/**
+	 * The array of running child processes
+	 */
+	protected $children = array();
+
+	/**
+	 * The array of jobs that have workers running
+	 */
+	protected $jobs = array();
+
+	/**
+	 * The PID of the running process. Set for parent and child processes
+	 */
+	protected $pid = 0;
+
+	/**
+	 * The PID of the parent process, when running in the forked helper.
+	 */
+	public $parent_pid = 0;
+
+	/**
+	 * PID file for the parent process
+	 */
+	protected $pid_file = "";
+
+	/**
+	 * PID of helper child
+	 */
+	protected $helper_pid = 0;
+
+	/**
+	 * The user to run as
+	 */
+	protected $user = null;
+
+	/**
+	 * If true, the worker code directory is checked for updates and workers
+	 * are restarted automatically.
+	 */
+	protected $check_code = false;
+
+	/**
+	 * Holds the last timestamp of when the code was checked for updates
+	 */
+	protected $last_check_time = 0;
+	/**
+	 * gm_last_modify_time 
+	 * 
+	 * @var float
+	 * @access protected
+	 */
+	public $gm_last_modified_time = 0;
+
+	/**
+	 * When forking helper children, the parent waits for a signal from them
+	 * to continue doing anything
+	 */
+	protected $wait_for_signal = false;
+
+	/**
+	 * Directory where worker functions are found
+	 */
+	protected $worker_dir = "";
+
+	/**
+	 * Number of workers that do all jobs
+	 */
+	protected $do_all_count = 0;
+
+	/**
+	 * Maximum time a worker will run
+	 */
+	protected $max_run_time = 3600;
+
+	/**
+	 * Maximum number of jobs this worker will do before quitting
+	 */
+	protected $max_job_count = 0;
+
+	/**
+	 * Maximum job iterations per worker
+	 */
+	protected $max_runs_per_worker = null;
+
+	/**
+	 * Number of times this worker has run a job
+	 */
+	protected $job_execution_count = 0;
+
+	/**
+	 * Servers that workers connect to
+	 */
+	protected $servers = array();
+
+	/**
+	 * List of functions available for work
+	 */
+	protected $functions = array();
+
+	/**
+	 * Function/Class prefix
+	 */
+	protected $prefix = "";
+	/**
+	 *  
+	 */
+	private static $instance;
+	/**
+	 * __construct 
+	 * 
+	 * @access public
+	 * @return mixed
+	 */
+	public function __construct(){
+		self::$instance =& $this;
+		// Assign all the class objects that were instantiated by the
+		// bootstrap file (CodeIgniter.php) to local class variables
+		// so that CI can run as one big super object.
+		foreach (is_loaded() as $var => $class)
+		{
+			$this->$var =& load_class($class);
+		}
+
+		$this->load =& load_class('Loader', 'core');
+
+		$this->load->initialize();
+		L('Gearman_Manager Class Initialized',6);
+		$this->_log =& $this->log;
+	}
+	/**
+	 * Creates the manager and gets things going
+	 *
+	 */
+	public function run() {
+		if(!function_exists("posix_kill")){
+			$this->show_help("The function posix_kill was not found. Please ensure POSIX functions are installed");
+		}
+		if(!function_exists("pcntl_fork")){
+			$this->show_help("The function pcntl_fork was not found. Please ensure Process Control functions are installed");
+		}
+		$this->pid = getmypid();
+		/**
+		 * Parse command line options. Loads the config file as well
+		 */
+		$this->getopt();
+		/**
+		 * Load up the workers
+		 */
+		$this->load_workers();
+		$this->load_servers();
+
+		if(empty($this->functions)){
+			L("No workers found",1);
+			posix_kill($this->pid, SIGUSR1);
+			exit(__FILE__.__LINE__ . PHP_EOL);
+		}
+
+		$this->hooks->_call_hook('pre_process'); //pre_system // hook 
+		if ($this->config->item('mode', 'mgr_config') == 'cli'){
+			load_class('Worker', 'core');
+			require_once APPPATH . 'config/input.php';
+			foreach ($this->functions as $func=>$job_name){
+				require_once $this->functions[$func]["path"];
+				if(class_exists($func) && method_exists($func, "run") && isset($input[$func])){
+					L("Creating a $func object",6);
+					$obj = new $func();
+					$job = $input[$func];
+					$result = $obj->run($job, $log);
+					var_dump(msgpack_unpack($result), $log);
+				}
+			}
+			exit(__FILE__.__LINE__ . PHP_EOL);
+		}
+		/**
+		 * Register signal listeners
+		 */
+		$this->register_ticks();
+		/**
+		 * Validate workers in the helper process
+		 */
+		//$this->fork_me("validate_workers");
+
+		L("Started with pid $this->pid",6);
+
+		/**
+		 * Start the initial workers and set up a running environment
+		 */
+		$this->bootstrap();
+
+
+		/**
+		 * Main processing loop for the parent process
+		 */
+		while(!$this->stop_work || count($this->children)) {
+
+			$this->process_loop();
+
+			/**
+			 * php will eat up your cpu if you don't have this
+			 */
+			usleep(50000);
+
+		}
+
+		/**
+		 * Kill the helper if it is running
+		 */
+		if(isset($this->helper_pid)){
+			posix_kill($this->helper_pid, SIGKILL);
+		}
+
+		L("Exiting",4);
+
+	}
+
+	protected function process_loop() {
+
+		$status = 0;
+
+		/**
+		 * Check for exited children
+		 */
+		$exited = pcntl_wait( $status, WNOHANG );
+		//$exited = pcntl_waitpid(-1,  $status);
+
+
+		/**
+		 * We run other children, make sure this is a worker
+		 */
+		if(isset($this->children[$exited])){
+			/**
+			 * If they have exited, remove them from the children array
+			 * If we are not stopping work, start another in its place
+			 */
+			if($exited) {
+				$worker = $this->children[$exited];
+				unset($this->children[$exited]);
+				L("Child $exited exited ($worker) status($status) error(". posix_get_last_error() .")",2);
+				if(!$this->stop_work){
+					$this->start_worker($worker);
+				}
+			}
+		}
+
+
+		if($this->stop_work && time() - $this->stop_time > 60){
+			L("Children have not exited, killing.",1);
+			$this->stop_children(SIGKILL);
+		}
+
+	}
+
+
+	/**
+	 * Handles anything we need to do when we are shutting down
+	 *
+	 */
+	public function __destruct() {
+		if($this->isparent){
+			if(!empty($this->pid_file) && file_exists($this->pid_file)){
+				if(!unlink($this->pid_file)) {
+					L("Could not delete PID file",1);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Parses the command line options
+	 *
+	 */
+	protected function getopt() {
+		$opts = getopt("ac:dD:h:Hl:m:o:p:P:u:v::w:r:x:Z");
+		if(empty($opts) || isset($opts["H"])){
+			$this->show_help();
+		}
+
+		if(isset($opts["c"]) && !file_exists($opts["c"])){
+			$this->show_help("Config file $opts[c] not found.");
+		}
+		/**
+		 * parse the config file
+		 */
+		if(isset($opts["c"])){
+			$this->parse_config($opts["c"]);
+		}
+
+		/**
+		 * command line opts always override config file
+		 */
+		if (isset($opts['P'])) {
+			$this->mgr_config['pid_file'] = $opts['P'];
+		}
+
+
+		if (isset($opts['a'])) {
+			$this->mgr_config['auto_update'] = 1;
+		}
+
+		if (isset($opts['w'])) {
+			$this->mgr_config['worker_dir'] = $opts['w'];
+		}
+		if (isset($opts['m'])) {
+			$this->mgr_config['mode'] = $opts['m'];
+		}
+
+		if (isset($opts['x'])) {
+			$this->mgr_config['max_worker_lifetime'] = (int)$opts['x'];
+		}
+
+		if (isset($opts['r'])) {
+			$this->mgr_config['max_runs_per_worker'] = (int)$opts['r'];
+		}
+
+		if (isset($opts['D'])) {
+			$this->mgr_config['count'] = (int)$opts['D'];
+		}
+
+		if (isset($opts['h'])) {
+			$this->mgr_config['host'] = $opts['h'];
+		}
+
+		if (isset($opts['p'])) {
+			$this->prefix = $opts['p'];
+		} elseif(!empty($this->mgr_config['prefix'])) {
+			$this->prefix = $this->mgr_config['prefix'];
+		}
+
+		if(isset($opts['u'])){
+			$this->user = $opts['u'];
+		} elseif(isset($this->mgr_config["user"])){
+			$this->user = $this->mgr_config["user"];
+		}
+
+		/**
+		 * If we want to daemonize, fork here and exit
+		 */
+		if(isset($opts["d"]) || (isset($this->mgr_config['daemon'])  && $this->mgr_config['daemon'] == TRUE)){
+			$pid = pcntl_fork();
+			if($pid>0){
+				$this->isparent = false;
+				exit(__FILE__.__LINE__ . PHP_EOL);
+			}
+			$this->pid = getmypid();
+			posix_setsid();
+		}
+
+		if(!empty($this->mgr_config['pid_file'])){
+			$fp = fopen($this->mgr_config['pid_file'], "w");
+			if($fp){
+				fwrite($fp, $this->pid);
+				fclose($fp);
+			} else {
+				$this->show_help("Unable to write PID to {$this->mgr_config['pid_file']}");
+			}
+			$this->pid_file = $this->mgr_config['pid_file'];
+		}
+
+		if($this->user) {
+			$user = posix_getpwnam($this->user);
+			if (!$user || !isset($user['uid'])) {
+				$this->show_help("User ({$this->user}) not found.");
+			}
+
+			/**
+			 * Ensure new uid can read/write pid and log files
+			 */
+			if(!empty($this->pid_file)){
+				if(!chown($this->pid_file, $user['uid'])){
+					L("Unable to chown PID file to {$this->user}",1);
+				}
+			}
+			if(!empty($this->log_file_handle)){
+				if(!chown($this->log_file, $user['uid'])){
+					L("Unable to chown log file to {$this->user}",1);
+				}
+			}
+			$user['uid'] = isset($user['uid']) ?  $user['uid'] : 99;
+			$user['gid'] = isset($user['gid']) ?  $user['gid'] : 99;
+			posix_setgid($user['gid']);
+			if (posix_getegid() != $user['gid']) {
+				$this->show_help("Unable to change user to {$this->user} (GID: {$user['gid']}).". posix_strerror(posix_get_last_error()));
+			}
+
+			posix_setuid($user['uid']);
+			if (posix_geteuid() != $user['uid']) {
+				$this->show_help("Unable to change user to {$this->user} (UID: {$user['uid']})." . posix_strerror(posix_get_last_error()));
+			}
+
+			L("User set to user {$this->user} ",1);
+		}
+
+		if(!empty($this->mgr_config['auto_update'])){
+			$this->check_code = true;
+		}
+
+		if(!empty($this->mgr_config['worker_dir'])){
+			$this->worker_dir = $this->mgr_config['worker_dir'];
+		} else {
+			$this->worker_dir = "workers";
+		}
+
+		$dirs = explode(",", $this->worker_dir);
+		foreach($dirs as &$dir){
+			$dir = sprintf('%s/%s/', APPPATH, trim($dir));
+			if(!file_exists($dir)){
+				$this->show_help("Worker dir ".$dir." not found");
+			}
+		}
+		unset($dir);
+
+		if(!empty($this->mgr_config['max_worker_lifetime'])){
+			$this->max_run_time = (int)$this->mgr_config['max_worker_lifetime'];
+		}
+
+		if(!empty($this->mgr_config['count'])){
+			$this->do_all_count = (int)$this->mgr_config['count'];
+		}
+
+		if(!empty($this->mgr_config['host'])){
+			if(!is_array($this->mgr_config['host'])){
+				$this->servers = explode(",", $this->mgr_config['host']);
+			} else {
+				$this->servers = $this->mgr_config['host'];
+			}
+		} else {
+			$this->servers = array("127.0.0.1");
+		}
+
+		if (!empty($this->mgr_config['include']) && $this->mgr_config['include'] != "*") {
+			$this->mgr_config['include'] = explode(",", $this->mgr_config['include']);
+		} else {
+			$this->mgr_config['include'] = array();
+		}
+
+		if (!empty($this->mgr_config['exclude'])) {
+			$this->mgr_config['exclude'] = explode(",", $this->mgr_config['exclude']);
+		} else {
+			$this->mgr_config['exclude'] = array();
+		}
+
+		/**
+		 * Debug option to dump the config and exit
+		 */
+		if(isset($opts["Z"])){
+			print_r($this->mgr_config);
+			exit(__FILE__.__LINE__ . PHP_EOL);
+		}
+		$this->config->_assign_to_config(array('mgr_config'=>$this->mgr_config));
+
+	}
+
+
+	/**
+	 *   Opens the logfile.  Will assign to $this->log_file_handle
+	 *
+	 *    @param   string    $file     The config filename.
+	 *
+	 */
+	protected function open_log_file($file) {
+		if ($this->log_file_handle) {
+			fclose($this->log_file_handle);
+		}
+		$this->log_file_handle = fopen($file, "a");
+		if(!$this->log_file_handle){
+			$this->show_help("Could not open log file $file");
+		}
+	}
+
+	/**
+	 * Parses the config file
+	 *
+	 * @param   string    $file     The config file. Just pass so we don't have
+	 *                              to keep it around in a var
+	 */
+	protected function parse_config($file) {
+		L("Loading configuration from $file",6);
+		if(substr($file, -4) == ".php"){
+			require $file;
+		} elseif(substr($file, -4) == ".ini"){
+			$gearman_config = parse_ini_file($file, true);
+		}
+		if(empty($gearman_config)){
+			$this->show_help("No configuration found in $file");
+		}
+
+		if (isset($gearman_config[self::DEFAULT_CONFIG])) {
+			$this->mgr_config = $gearman_config[self::DEFAULT_CONFIG];
+			$this->mgr_config['functions'] = array();
+		}
+
+		foreach($gearman_config as $function=>$data){
+			if (strcasecmp($function, self::DEFAULT_CONFIG) != 0) {
+				$this->mgr_config['functions'][$function] = $data;
+			}
+
+		}
+	}
+	/**
+	 * load_servers 
+	 * 
+	 * @access protected
+	 * @return mixed
+	 */
+	protected function load_servers() {
+		if(file_exists(GM_CONF)){
+			$this->servers = array();
+			$config_text = json_decode(file_get_contents(GM_CONF), TRUE);
+			$locate_conf = realpath(dirname(__FILE__).'/../../../') . '/gm.conf';
+			if (file_exists($locate_conf)) {
+				$locate_config_text = json_decode(file_get_contents($locate_conf), TRUE);
+				if ($locate_config_text){
+					$config_text = array_merge($config_text, $locate_config_text);
+				}
+			}
+			foreach ($this->functions as $worker=>$settings){
+				$worker = sprintf('%s%s', !isset($this->mgr_config['function_prefix']) ? '':
+						$this->mgr_config['function_prefix'], $worker);
+				if (isset($config_text[$worker]['host']) && $config_text[$worker]['host']){
+					foreach ($config_text[$worker]['host'] as $host){
+						array_push($this->servers, $host);
+					}
+				}else{
+					L("$worker register host not exists.",1);
+					exit(__FILE__.__LINE__ . PHP_EOL);
+				}
+			}
+			$this->servers = array_unique($this->servers);
+		}else{
+			L("/opt/wwwroot/conf/gm.conf  not exists.",1);
+		}
+	}
+
+	/**
+	 * Helper function to load and filter worker files
+	 *
+	 * return @void
+	 */
+	protected function load_workers() {
+		$this->functions = array();
+		$dirs = explode(",", $this->worker_dir);
+		foreach($dirs as $dir){
+			$dir = sprintf('%s%s', APPPATH, $dir);
+			L("Loading workers in ".$dir,6);
+			$worker_files = glob($dir."/*.php");
+			if (!empty($worker_files)) {
+				foreach($worker_files as $file){
+					$function = substr(basename($file), 0, -4);
+					/**
+					 * include workers
+					 */
+					if (!empty($this->mgr_config['include'])) {
+						if (!in_array($function, $this->mgr_config['include'])) {
+							continue;
+						}
+					}
+
+					/**
+					 * exclude workers
+					 */
+					if (in_array($function, $this->mgr_config['exclude'])) {
+						continue;
+					}
+
+					if(!isset($this->functions[$function])){
+						$this->functions[$function] = array();
+					}
+
+					if(!empty($this->mgr_config['functions'][$function]['dedicated_only'])){
+
+						if(empty($this->mgr_config['functions'][$function]['dedicated_count'])){
+							L("Invalid configuration for dedicated_count for function $function.",1);
+							exit(__FILE__.__LINE__ . PHP_EOL);
+						}
+
+						$this->functions[$function]['dedicated_only'] = true;
+						$this->functions[$function]["count"] = $this->mgr_config['functions'][$function]['dedicated_count'];
+
+					} else {
+
+						$min_count = max($this->do_all_count, 1);
+						if(!empty($this->mgr_config['functions'][$function]['count'])){
+							$min_count = max($this->mgr_config['functions'][$function]['count'], $this->do_all_count);
+						}
+
+						if(!empty($this->mgr_config['functions'][$function]['dedicated_count'])){
+							$ded_count = $this->do_all_count + $this->mgr_config['functions'][$function]['dedicated_count'];
+						} elseif(!empty($this->mgr_config["dedicated_count"])){
+							$ded_count = $this->do_all_count + $this->mgr_config["dedicated_count"];
+						} else {
+							$ded_count = $min_count;
+						}
+
+						$this->functions[$function]["count"] = max($min_count, $ded_count);
+
+					}
+
+					$this->functions[$function]['path'] = $file;
+
+					/**
+					 * Note about priority. This exploits an undocumented feature
+					 * of the gearman daemon. This will only work as long as the
+					 * current behavior of the daemon remains the same. It is not
+					 * a defined part fo the protocol.
+					 */
+					if(!empty($this->mgr_config['functions'][$function]['priority'])){
+						$priority = max(min(
+									$this->mgr_config['functions'][$function]['priority'],
+									self::MAX_PRIORITY), self::MIN_PRIORITY);
+					} else {
+						$priority = 0;
+					}
+
+					$this->functions[$function]['priority'] = $priority;
+
+				}
+			}
+		}
+	}
+
+	/**
+	 * Forks the process and runs the given method. The parent then waits
+	 * for the child process to signal back that it can continue
+	 *
+	 * @param   string  $method  Class method to run after forking
+	 *
+	 */
+	protected function fork_me($method){
+		$this->wait_for_signal = true;
+		$pid = pcntl_fork();
+		switch($pid) {
+			case 0:
+				$this->isparent = false;
+				$this->parent_pid = $this->pid;
+				$this->pid = getmypid();
+				$this->$method();
+				break;
+			case -1:
+				L("Failed to fork",1);
+				$this->stop_work = true;
+				break;
+			default:
+				$this->helper_pid = $pid;
+				while($this->wait_for_signal && !$this->stop_work) {
+					usleep(5000);
+					pcntl_waitpid($pid, $status, WNOHANG);
+
+					if (pcntl_wifexited($status) && $status) {
+						L("Child exited with non-zero exit code $status error ".posix_get_last_error() .". ",1);
+						exit(1);
+					}
+
+				}
+				break;
+		}
+	}
+
+
+	/**
+	 * Forked method that validates the worker code and checks it if desired
+	 *
+	 */
+	protected function validate_workers(){
+		L("Helper forked",4);
+
+		$this->load_workers();
+
+		if(empty($this->functions)){
+			L("No workers found",1);
+			posix_kill($this->parent_pid, SIGUSR1);
+			exit(__FILE__.__LINE__ . PHP_EOL);
+		}
+
+		$this->validate_lib_workers();
+
+		/**
+		 * Since we got here, all must be ok, send a CONTINUE
+		 */
+		posix_kill($this->parent_pid, SIGCONT);
+
+		if($this->check_code){
+			L("Running loop to check for new code",4);
+			$last_check_time    = 0;
+			$last_check_version = 0;
+			while(1) {
+				while(1){
+					$check_version = $this->config->item('check_version') == '' ||  ENVIRONMENT =='production' ?
+						'/opt/wwwroot/check/version' : $this->config->item('check_version'); 
+					if (file_exists($check_version)){ //增加开关功能
+						clearstatcache();
+						L("Running loop to check for new version",6);
+						$max_version_time  = 0;
+						$mtime        = filemtime($check_version);
+						$max_version_time = max($mtime, $max_version_time);
+						if($last_check_version!=0 && $mtime > $last_check_version){
+							L("New version found. Begining check files.",4);
+							$last_check_version = $max_version_time ;
+							//posix_kill($this->parent_pid, SIGHUP);
+							break;
+						}
+						$last_check_version = $max_version_time ;
+						sleep(5);
+					}else{
+						break;
+					}
+				}
+				$file_list = $this->file_list();
+				$max_time  = 0;
+				foreach($file_list as $name => $file){
+					clearstatcache();
+					$func = array();
+					$func['path'] = $file;
+					$mtime        = filemtime($func['path']);
+					$max_time     = max($max_time, $mtime);
+					L("{$func['path']} - $mtime $last_check_time",6);
+					if($last_check_time!=0 && $mtime > $last_check_time){
+						L("New code found. Sending SIGHUP file: {$func['path']}",6);
+						posix_kill($this->parent_pid, SIGHUP);
+						break;
+					}
+				}
+				$last_check_time = $max_time;
+				sleep(5);
+			}
+		} else {
+			exit(__FILE__.__LINE__ . PHP_EOL);
+		}
+
+	}
+
+	/**
+	 * Bootstap a set of workers and any vars that need to be set
+	 *
+	 */
+	protected function bootstrap() {
+
+		$function_count = array();
+
+		/**
+		 * If we have "do_all" workers, start them first
+		 * do_all workers register all functions
+		 */
+		if(!empty($this->do_all_count) && is_int($this->do_all_count)){
+
+			for($x=0;$x<$this->do_all_count;$x++){
+				$this->start_worker();
+			}
+
+			foreach($this->functions as $worker => $settings){
+				if(empty($settings["dedicated_only"])){
+					$function_count[$worker] = $this->do_all_count;
+				}
+			}
+
+		}
+
+		/**
+		 * Next we loop the workers and ensure we have enough running
+		 * for each worker
+		 */
+		foreach($this->functions as $worker=>$config) {
+
+			/**
+			 * If we don't have do_all workers, this won't be set, so we need
+			 * to init it here
+			 */
+			if(empty($function_count[$worker])){
+				$function_count[$worker] = 0;
+			}
+
+			while($function_count[$worker] < $config["count"]){
+				$this->start_worker($worker);
+				$function_count[$worker]++;;
+			}
+
+			/**
+			 * php will eat up your cpu if you don't have this
+			 */
+			usleep(50000);
+
+		}
+
+		/**
+		 * Set the last code check time to now since we just loaded all the code
+		 */
+		$this->last_check_time = time();
+
+	}
+
+	protected function start_worker($worker="all") {
+
+		static $all_workers;
+
+		if($worker == "all"){
+			if(is_null($all_workers)){
+				$all_workers = array();
+				foreach($this->functions as $func=>$settings){
+					if(empty($settings["dedicated_only"])){
+						$all_workers[] = $func;
+					}
+				}
+			}
+			$worker_list = $all_workers;
+		} else {
+			$worker_list = array($worker);
+		}
+
+		$pid = pcntl_fork();
+
+		switch($pid) {
+
+			case 0:
+
+				$this->isparent = false;
+
+				$this->register_ticks(false);
+
+				$this->pid = getmypid();
+
+				if(count($worker_list) > 1){
+
+					// shuffle the list to avoid queue preference
+					shuffle($worker_list);
+
+					// sort the shuffled array by priority
+					uasort($worker_list, array($this, "sort_priority"));
+				}
+				$this->start_lib_worker($worker_list);
+
+				L("Child exiting",6);
+
+				exit(__FILE__.__LINE__ . PHP_EOL);
+
+				break;
+
+			case -1:
+
+				L("Could not fork". pcntl_strerror(pcntl_get_last_error()),1);
+				$this->stop_work = true;
+				$this->stop_children();
+				break;
+
+			default:
+
+				// parent
+				L("Started child $pid (".implode(",", $worker_list).") waiting for working.",1);
+				$this->children[$pid] = $worker;
+		}
+
+	}
+
+	/**
+	 * Sorts the function list by priority
+	 */
+	private function sort_priority($a, $b) {
+		$func_a = $this->functions[$a];
+		$func_b = $this->functions[$b];
+
+		if(!isset($func_a["priority"])){
+			$func_a["priority"] = 0;
+		}
+		if(!isset($func_b["priority"])){
+			$func_b["priority"] = 0;
+		}
+		if ($func_a["priority"] == $func_b["priority"]) {
+			return 0;
+		}
+		return ($func_a["priority"] > $func_b["priority"]) ? -1 : 1;
+	}
+
+	/**
+	 * Stops all running children
+	 */
+	protected function stop_children($signal=SIGTERM) {
+		L("Stopping children",6);
+
+		foreach($this->children as $pid=>$worker){
+			L("Stopping child $pid ($worker)",6);
+			posix_kill($pid, $signal);
+		}
+
+	}
+
+	/**
+	 * Registers the process signal listeners
+	 */
+	protected function register_ticks($parent=true) {
+
+		if($parent){
+			L("Registering signals for parent",6);
+			pcntl_signal(SIGTERM, array($this, "signal"));
+			pcntl_signal(SIGINT,  array($this, "signal"));
+			pcntl_signal(SIGUSR1,  array($this, "signal"));
+			pcntl_signal(SIGUSR2,  array($this, "signal"));
+			pcntl_signal(SIGCONT,  array($this, "signal"));
+			pcntl_signal(SIGHUP,  array($this, "signal"));
+		} else {
+			L("Registering signals for child",6);
+			$res = pcntl_signal(SIGTERM, array($this, "signal"));
+			if(!$res){
+				exit(__FILE__.__LINE__ . PHP_EOL);
+			}
+		}
+	}
+
+	/**
+	 * Handles signals
+	 */
+	public function signal($signo) {
+
+		static $term_count = 0;
+
+		if(!$this->isparent){
+
+			$this->stop_work = true;
+
+		} else {
+
+			switch ($signo) {
+				case SIGUSR1:
+					$this->show_help("No worker files could be found");
+					break;
+				case SIGUSR2:
+					$this->show_help("Error validating worker functions");
+					break;
+				case SIGCONT:
+					$this->wait_for_signal = false;
+					break;
+				case SIGINT:
+				case SIGTERM:
+					L("Shutting down...",6);
+					$this->stop_work = true;
+					$this->stop_time = time();
+					$term_count++;
+					if($term_count < 5){
+						$this->stop_children();
+					} else {
+						$this->stop_children(SIGKILL);
+					}
+					break;
+				case SIGHUP:
+					L("Restarting children",4);
+					if ($this->log_file) {
+						$this->open_log_file($this->log_file);
+					}
+					$this->stop_children();
+					break;
+				default:
+					// handle all other signals
+			}
+		}
+
+	}
+
+
+	/**
+	 * Shows the scripts help info with optional error message
+	 */
+	protected function show_help($msg = "") {
+		if($msg){
+			echo "ERROR:\n";
+			echo "  ".wordwrap($msg, 72, "\n  ")."\n\n";
+		}
+		echo "Gearman worker manager script\n\n";
+		echo "USAGE:\n";
+		echo "  # ". $_SERVER['argv'][0] . " -H | -c CONFIG [-v] [-l LOG_FILE] [-d] [-v] [-a] [-P PID_FILE]\n\n";
+		echo "OPTIONS:\n";
+		echo "  -a             Automatically check for new worker code\n";
+		echo "  -c CONFIG      Worker configuration file\n";
+		echo "  -d             Daemon, detach and run in the background\n";
+		echo "  -D NUMBER      Start NUMBER workers that do all jobs\n";
+		echo "  -h HOST[:PORT] Connect to HOST and optional PORT\n";
+		echo "  -H             Shows this help\n";
+		echo "  -l LOG_FILE    Log output to LOG_FILE or use keyword 'syslog' for syslog support\n";
+		echo "  -p PREFIX      Optional prefix for functions/classes of PECL workers. PEAR requires a constant be defined in code.\n";
+		echo "  -P PID_FILE    File to write process ID out to\n";
+		echo "  -u USERNAME    Run wokers as USERNAME\n";
+		echo "  -v             Increase verbosity level by one\n";
+		echo "  -w DIR         Directory where workers are located, defaults to ./workers. If you are using PECL, you can provide multiple directories separated by a comma.\n";
+		echo "  -r NUMBER      Maximum job iterations per worker\n";
+		echo "  -x SECONDS     Maximum seconds for a worker to live\n";
+		echo "  -Z             Parse the command line and config file then dump it to the screen and exit.\n";
+		echo "\n";
+		exit();
+	}
+	/**
+	 * Starts a worker for the PECL library
+	 *
+	 * @param   array   $worker_list    List of worker functions to add
+	 * @return  void
+	 *
+	 */
+	protected function start_lib_worker($worker_list) {
+
+		$thisWorker = new GearmanWorker();
+
+		//$thisWorker->addOptions(GEARMAN_WORKER_NON_BLOCKING);
+		//$thisWorker->addOptions(GEARMAN_WORKER_TIMEOUT_RETURN);
+		//$thisWorker->addOptions(GEARMAN_WORKER_GRAB_UNIQ);
+		$thisWorker->setTimeout(5000);
+
+		foreach($this->servers as $s){
+			L("Adding server:$s",6);
+			$thisWorker->addServers($s);
+		}
+		foreach($worker_list as $w){
+			L("Adding job:$w",6);
+			$w = sprintf('%s%s', !isset($this->mgr_config['function_prefix']) ? '': $this->mgr_config['function_prefix'], $w);
+			$thisWorker->addFunction($w, array($this, "do_job"), $this);
+		}
+
+		$start = time();
+
+		while(!$this->stop_work){
+			if($thisWorker->work() ||
+					$thisWorker->returnCode() == GEARMAN_IO_WAIT ||
+					$thisWorker->returnCode() == GEARMAN_NO_JOBS) {
+
+				if ($thisWorker->returnCode() == GEARMAN_SUCCESS) continue;
+
+				if (!$thisWorker->wait()){
+					if ($thisWorker->returnCode() == GEARMAN_NO_ACTIVE_FDS){
+						sleep(5);
+					}else{
+						L(' GEARMAN_NO_ACTIVE_FDS :'. $thisWorker->returnCode(),1);
+					}
+				}else{
+					L('Worker wait ok. code:'. $thisWorker->returnCode(),6);
+				}
+
+			}
+
+			/**
+			 * Check the running time of the current child. If it has
+			 * been too long, stop working.
+			 */
+			if($this->max_run_time > 0 && time() - $start > $this->max_run_time) {
+				L("Been running too long, exiting",4);
+				$this->stop_work = true;
+			}
+
+			if(!empty($this->mgr_config["max_runs_per_worker"]) && $this->job_execution_count >= $this->mgr_config["max_runs_per_worker"]) {
+				L("Ran $this->job_execution_count jobs which is over the maximum({$this->mgr_config['max_runs_per_worker']}), exiting",4);
+				$this->stop_work = true;
+			}
+
+		}
+
+		$thisWorker->unregisterAll();
+
+
+	}
+
+	/**
+	 * Wrapper function handler for all registered functions
+	 * This allows us to do some nice logging when jobs are started/finished
+	 */
+	public function do_job($job) {
+
+		static $objects;
+
+		if($objects===null) $objects = array();
+
+
+		$w = $job->workload();
+
+		$h = $job->handle();
+
+		$job_name = substr($job->functionName(), strlen($this->mgr_config['function_prefix']));
+
+		if($this->prefix){
+			$func = $this->prefix . $job_name;
+		} else {
+			$func = $job_name;
+		}
+
+		if(empty($objects[$job_name]) && !function_exists($func) && !class_exists($func)){
+
+			if(!isset($this->functions[$job_name])){
+				L("Function $func is not a registered job name",1);
+				return;
+			}
+			require_once BASEPATH.'core/Worker.php';
+			if (file_exists(APPPATH.'core/'.$this->config->item('subclass_prefix').'Worker.php')){
+				require_once APPPATH.'core/'.$this->config->item('subclass_prefix').'Worker.php';
+			}elseif(file_exists(APPPATH.'core/'.$this->config->item('subclass_prefix').'worker.php')){
+				require_once APPPATH.'core/'.$this->config->item('subclass_prefix').'worker.php';
+			}
+
+			require_once $this->functions[$job_name]["path"];
+			if(class_exists($func) && method_exists($func, "run")){
+
+				L("Creating a $func object",6);
+				$objects[$job_name] = new $func();
+
+			} elseif(!function_exists($func)) {
+
+				L("Function $func not found",1);
+				return;
+			}
+
+		}
+		$unique = $job->unique();
+		L("($h) ($func) ($unique) Starting Job: $job_name",6);
+
+		L("($h) Workload: ". json_encode(msgpack_unpack($w)),6);
+
+		$log = array();
+
+		/**
+		 * Run the real function here
+		 */
+		if(isset($objects[$job_name])){
+			L("($h) Calling object for $job_name.",6);
+			$result = $objects[$job_name]->run($job, $log);
+		} elseif(function_exists($func)) {
+			L("($h) Calling function for $job_name.",6);
+			$result = $func($job, $log);
+		} else {
+			L("($h) FAILED to find a function or class for $job_name.",1);
+		}
+
+		L("Final output sent to gearman Server",6);
+
+		/**
+		 * Workaround for PECL bug #17114
+		 * http://pecl.php.net/bugs/bug.php?id=17114
+		 */
+		$type = gettype($result);
+		settype($result, $type);
+
+		$this->job_execution_count++;
+
+		return $result;
+
+	}
+
+	/**
+	 * Validates the PECL compatible worker files/functions
+	 */
+	protected function validate_lib_workers() {
+
+		foreach($this->functions as $func => $props){
+			require_once BASEPATH.'core/Worker.php';
+			if (file_exists(APPPATH.'core/'.$this->config->item('subclass_prefix').'Worker.php')){
+				require_once APPPATH.'core/'.$this->config->item('subclass_prefix').'Worker.php';
+			}elseif(file_exists(APPPATH.'core/'.$this->config->item('subclass_prefix').'worker.php')){
+				require_once APPPATH.'core/'.$this->config->item('subclass_prefix').'worker.php';
+			}
+			require_once $props["path"];
+			$real_func = $this->prefix.$func;
+			if(!function_exists($real_func) &&
+					(!class_exists($real_func) || !method_exists($real_func, "run"))){
+				L("Function $real_func not found in ".$props["path"],6);
+				posix_kill($this->pid, SIGUSR2);
+				exit(__FILE__.__LINE__ . PHP_EOL);
+			}
+		}
+
+	}
+	/**
+	 * file_list 
+	 * 
+	 * @access protected
+	 * @return mixed
+	 */
+	protected function  file_list(){
+		$file_list = array();
+		$this->load->helper('file');
+		foreach (array(BASEPATH, APPPATH) as $path){
+			$file_list_tmp = file_list($path, '.php');
+			if ( $file_list_tmp ===FALSE) continue;
+			foreach ($file_list_tmp as $file){
+				$file_list[] = $file;
+			}
+			unset($file_list_tmp);
+		}
+		return $file_list;
+	}
+	/**
+	 * &get_instance 
+	 * 
+	 * @static
+	 * @access public
+	 * @return mixed
+	 */
+	public static function &get_instance()
+	{
+		return self::$instance;
+	}
+
+}
+/*  vim: set ts=4 sw=4 sts=4 tw=100 noet: */

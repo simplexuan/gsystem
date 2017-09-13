@@ -1,0 +1,65 @@
+@20150331
+1, 增加永久二维码生成接口
+
+changelog0611
+1. add hook
+changelog0511
+1. 新增表单验证功能
+  使用步骤
+    1. config.php 新增
+       $config['language']      = 'english';
+       $config['charset']       = 'UTF-8'
+    2. form_validation.php 配置 参考 config/form_validation.php 
+    3. 推荐在workers中增加验证规则，使用方式参考 example/workers/id_allocate.php 
+
+CHANGELOG0409
+变更json传输格式为msgpack
+
+新增功能0401：
+一、新增命令运行模式
+   1. 修改config/development/gearman.php 新增 mode = cli 方式运行
+   2. 新增config/input.php文件作为worker参数输入，具体格式参考input.php
+二、使用说明：
+   安装pcntl  gearman msgpack扩展 
+   svn://192.168.1.203/thirdsrc/icw/trunk /opt/wwwroot/thirdsrc/icw/
+   svn://192.168.1.203/thirdsrc/apache-log4php/trunk /opt/wwwroot/thirdsrc/apache-log4php/
+   
+   cd /opt/wwwroot/thirdsrc/icw/example/
+   /opt/app/php/bin/php example.php -c config/development/gearman.php -d
+   cd /opt/wwwroot/thirdsrc/icw/example/client/
+   /opt/app/php/bin/php  client.php 
+其它：
+   新增education demo
+接口格式说明：
+  请求格式
+  array(
+          'header'  => array(
+              'version'=>'', //请求版本
+              'signid'=>'', //请求唯一标志
+              'provider'=>'', //请求产品名称
+              'uid'     => '', // 用户Id
+              'uname'   => '', // 用户名
+              'ip'      => '', // 请求机器IP地址 整型
+              ),
+          'request' => array(
+              'c'       => '', // 请求类
+              'm'       => '', // 请求方法 
+              'p'       => '', // 请求参数
+              ),
+       );
+  返回格式
+  array(
+          'header'   => array(
+              'version'=>'', //请求版本
+              'signid'=>'',    //请求唯一标志
+              'provider'=>'', //返回产品名称
+              'uid'     => '', // 用户Id
+              'uname'   => '', // 用户名
+              'ip'      => '', // 返回机器IP地址 整型
+              ),
+          'response' => array(
+              'err_no'=>'', 'err_msg'=>'', 'results'=>array()
+              ),
+       );
+
+/*  vim: set ts=4 sw=4 sts=4 tw=100 noet: */
